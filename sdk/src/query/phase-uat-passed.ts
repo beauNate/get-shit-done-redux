@@ -1,8 +1,6 @@
 /**
  * isPhaseUatPassed — SDK predicate answering "is phase N's UAT contract satisfied?"
- *
- * Cycle 2 of ~15: introduces REASON_CODE frozen enum and UatReason typed shape.
- * Non-pass items (result not literally 'pass') emit a typed NON_PASS_RESULT reason.
+ * Implements the isPhaseUatPassed predicate per #3184.
  */
 
 import { readFile, readdir, stat } from 'node:fs/promises';
@@ -64,8 +62,9 @@ interface UatItem {
  * Passes are applied in order; each returns a sanitised string.
  */
 function stripMarkdownInjection(content: string): string {
-  // Pass 1: strip YAML frontmatter region (---\n...\n---)
-  let s = content.replace(/^---\r?\n[\s\S]*?\r?\n---/m, '');
+  // Pass 1: strip YAML frontmatter region (---\n...\n---). No /m flag — ^ must
+  // anchor to position 0 only, preventing mid-body --- separators from triggering.
+  let s = content.replace(/^---\r?\n[\s\S]*?\r?\n---/, '');
   // Pass 2: strip fenced code blocks (``` ... ```)
   s = s.replace(/```[\s\S]*?```/g, '');
   // Pass 3: strip HTML comment regions (<!-- ... -->)
@@ -75,8 +74,11 @@ function stripMarkdownInjection(content: string): string {
   return s;
 }
 
-function parseAllUatItems(content: string): UatItem[] {
-  const sanitised = stripMarkdownInjection(content);
+/**
+ * Parse all UAT items from already-stripped content.
+ * Callers must pass pre-stripped (sanitised) content — no internal strip is performed.
+ */
+function parseAllUatItems(sanitised: string): UatItem[] {
   const items: UatItem[] = [];
   UAT_ITEM_PATTERN.lastIndex = 0;
   let m: RegExpMatchArray | null;
@@ -91,6 +93,30 @@ function parseAllUatItems(content: string): UatItem[] {
   }
   UAT_ITEM_PATTERN.lastIndex = 0;
   return items;
+}
+
+/** Build a human-readable string for a single UatReason. */
+function humanizeReason(r: UatReason): string {
+  switch (r.code) {
+    case REASON_CODE.CASE_MISMATCH:
+      return `"${r.itemName ?? 'item'}" has a case-mismatched result ("${r.capturedValue ?? ''}" — expected "pass")`;
+    case REASON_CODE.NON_PASS_RESULT:
+      return `"${r.itemName ?? 'item'}" has result "${r.capturedValue ?? 'unknown'}" (expected "pass")`;
+    case REASON_CODE.NO_ITEMS_EXTRACTED:
+      return `${r.file ?? 'file'} contained no UAT items`;
+    case REASON_CODE.NO_PHASE_DIR:
+      return 'Phase directory not found';
+    case REASON_CODE.NO_UAT_FILES:
+      return 'No *-HUMAN-UAT.md files found in the phase directory';
+    case REASON_CODE.HUMAN_VERIFICATION_NEEDED:
+      return `"${r.itemName ?? 'item'}" requires manual human verification`;
+    case REASON_CODE.BRACKETED_PLACEHOLDER:
+      return `"${r.itemName ?? 'item'}" has an unfilled placeholder result: ${r.capturedValue ?? ''}`;
+    case REASON_CODE.ORPHAN_ITEM_MISSING_RESULT:
+      return `"${r.itemName ?? 'item'}" is missing a result field`;
+    default:
+      return `${r.code}: ${JSON.stringify(r)}`;
+  }
 }
 
 const HEADING_PATTERN = /###\s*(\d+)\.\s*([^\n]+)/g;
@@ -144,10 +170,11 @@ export async function isPhaseUatPassed(
 
   const dir = await resolvePhaseDir(phase, projectDir, workstream);
   if (!dir) {
+    const reasons: UatReason[] = [{ code: REASON_CODE.NO_PHASE_DIR }];
     return {
       passed: false,
-      reasons: [{ code: REASON_CODE.NO_PHASE_DIR }],
-      reasonsHuman: [],
+      reasons,
+      reasonsHuman: reasons.map(humanizeReason),
       items: [],
     };
   }
@@ -156,10 +183,11 @@ export async function isPhaseUatPassed(
   const uatFiles = files.filter((f) => f.endsWith('-HUMAN-UAT.md'));
 
   if (uatFiles.length === 0) {
+    const reasons: UatReason[] = [{ code: REASON_CODE.NO_UAT_FILES }];
     return {
       passed: false,
-      reasons: [{ code: REASON_CODE.NO_UAT_FILES }],
-      reasonsHuman: [],
+      reasons,
+      reasonsHuman: reasons.map(humanizeReason),
       items: [],
     };
   }
@@ -174,7 +202,7 @@ export async function isPhaseUatPassed(
     const strippedBody = stripMarkdownInjection(content);
     const itemsBeforeFile = items.length;
     const reasonsBeforeFile = reasons.length;
-    const parsed = parseAllUatItems(content);
+    const parsed = parseAllUatItems(strippedBody);
     for (const item of parsed) {
       items.push(item);
       if (item.result !== 'pass') {
@@ -247,7 +275,7 @@ export async function isPhaseUatPassed(
 
   const passed = items.length > 0 && reasons.length === 0;
 
-  return { passed, reasons, reasonsHuman: [], items };
+  return { passed, reasons, reasonsHuman: reasons.map(humanizeReason), items };
 }
 
 /**

@@ -1,5 +1,5 @@
 /**
- * Unit tests for isPhaseUatPassed — walking skeleton (cycle 1 of ~15).
+ * Tests for isPhaseUatPassed across UAT result classification paths.
  */
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
@@ -434,6 +434,132 @@ result: PASS
       expect(result.reasons.length).toBe(1);
       expect(result.reasons[0].code).toBe(REASON_CODE.CASE_MISMATCH);
       expect(result.reasons[0].capturedValue).toBe('PASS');
+    } finally {
+      await rm(localTmp, { recursive: true, force: true });
+    }
+  });
+
+  it('preserves UAT body content when file contains an internal --- horizontal rule', async () => {
+    // Regression: frontmatter regex with /m flag treated mid-body --- as a
+    // second frontmatter block and stripped everything between them.
+    const localTmp = await mkdtemp(join(tmpdir(), 'gsd-uat-hrule-'));
+    try {
+      const phaseDir = join(localTmp, '.planning', 'phases', '05-hrule');
+      await mkdir(phaseDir, { recursive: true });
+      const content = `---
+status: complete
+phase: 5
+---
+
+### 1. Item above rule
+expected: works
+result: pass
+
+---
+
+### 2. Item below rule
+expected: also works
+result: pass
+`;
+      await writeFile(join(phaseDir, '05-HUMAN-UAT.md'), content);
+
+      const result = await isPhaseUatPassed(localTmp, '5');
+      expect(result.passed).toBe(true);
+      expect(result.items.length).toBe(2);
+      expect(result.items[0].name).toBe('Item above rule');
+      expect(result.items[1].name).toBe('Item below rule');
+    } finally {
+      await rm(localTmp, { recursive: true, force: true });
+    }
+  });
+
+  it('aggregates items and reasons across multiple UAT files in the same phase', async () => {
+    // Finding #4: multiple *-HUMAN-UAT.md files — all-pass + one failure
+    const localTmp = await mkdtemp(join(tmpdir(), 'gsd-uat-multi-'));
+    try {
+      const phaseDir = join(localTmp, '.planning', 'phases', '05-multi');
+      await mkdir(phaseDir, { recursive: true });
+
+      const passFile = `---
+status: complete
+phase: 5
+---
+
+### 1. Passing check
+expected: it works
+result: pass
+`;
+      const failFile = `---
+status: complete
+phase: 5
+---
+
+### 1. Failing check
+expected: it works
+result: issue
+
+### 2. Another pass
+expected: also works
+result: pass
+`;
+      await writeFile(join(phaseDir, '05a-HUMAN-UAT.md'), passFile);
+      await writeFile(join(phaseDir, '05b-HUMAN-UAT.md'), failFile);
+
+      const result = await isPhaseUatPassed(localTmp, '5');
+      // Total items: 1 from first file + 2 from second file
+      expect(result.items.length).toBe(3);
+      // One NON_PASS_RESULT reason from the failing item
+      expect(result.reasons.length).toBe(1);
+      expect(result.reasons[0].code).toBe(REASON_CODE.NON_PASS_RESULT);
+      expect(result.passed).toBe(false);
+      // reasonsHuman must be non-empty
+      expect(result.reasonsHuman.length).toBe(1);
+      expect(typeof result.reasonsHuman[0]).toBe('string');
+      expect(result.reasonsHuman[0].length).toBeGreaterThan(0);
+    } finally {
+      await rm(localTmp, { recursive: true, force: true });
+    }
+  });
+
+  it('throws PhaseUatPassedError with INVALID_PHASE_NUM when phase arg is empty', async () => {
+    // Finding #5: INVALID_PHASE_NUM error path via phaseUatPassed handler
+    const { phaseUatPassed, ERROR_CODE: EC } = await import('./phase-uat-passed.js');
+    const localTmp = await mkdtemp(join(tmpdir(), 'gsd-uat-invalidphase-'));
+    try {
+      let thrown: unknown;
+      try {
+        await phaseUatPassed([], localTmp);
+      } catch (e) {
+        thrown = e;
+      }
+      expect(thrown).toBeInstanceOf(PhaseUatPassedError);
+      expect((thrown as PhaseUatPassedError).code).toBe(EC.INVALID_PHASE_NUM);
+    } finally {
+      await rm(localTmp, { recursive: true, force: true });
+    }
+  });
+
+  it('resolves isPhaseUatPassed via workstream routing', async () => {
+    // Finding #6: workstream-keyed project under .planning/workstreams/ws1/phases/
+    const localTmp = await mkdtemp(join(tmpdir(), 'gsd-uat-ws-'));
+    try {
+      const wsPhaseDir = join(localTmp, '.planning', 'workstreams', 'ws1', 'phases', '05-ws-phase');
+      await mkdir(wsPhaseDir, { recursive: true });
+      const content = `---
+status: complete
+phase: 5
+---
+
+### 1. WS item
+expected: works in workstream
+result: pass
+`;
+      await writeFile(join(wsPhaseDir, '05-HUMAN-UAT.md'), content);
+
+      const result = await isPhaseUatPassed(localTmp, '5', 'ws1');
+      expect(result.passed).toBe(true);
+      expect(result.items.length).toBe(1);
+      expect(result.items[0].name).toBe('WS item');
     } finally {
       await rm(localTmp, { recursive: true, force: true });
     }
